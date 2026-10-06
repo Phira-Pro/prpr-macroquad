@@ -351,6 +351,8 @@ pub struct DrawCallTelemetry {
 pub(crate) fn track_drawcall(
     pipeline: &miniquad::Pipeline,
     bindings: &miniquad::Bindings,
+    vertex_offset: usize,
+    indices_start: usize,
     indices_count: usize,
 ) {
     let texture = miniquad::Texture::new_render_texture(
@@ -365,8 +367,8 @@ pub(crate) fn track_drawcall(
     let pass = Some(miniquad::RenderPass::new(get_quad_context(), texture, None));
     get_quad_context().begin_pass(pass, miniquad::PassAction::clear_color(0.4, 0.8, 0.4, 1.));
     get_quad_context().apply_pipeline(pipeline);
-    get_quad_context().apply_bindings(bindings);
-    get_quad_context().draw(0, indices_count as _, 1);
+    get_quad_context().apply_bindings_with_offsets(bindings, &[vertex_offset]);
+    get_quad_context().draw(indices_start as _, indices_count as _, 1);
     get_quad_context().end_render_pass();
 
     get_profiler().drawcalls.push(DrawCallTelemetry {

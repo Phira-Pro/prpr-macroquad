@@ -18,9 +18,8 @@ pub enum DrawMode {
 pub struct GlPipeline(usize);
 
 struct DrawCall {
-    vertices: Vec<Vertex>,
-    indices: Vec<u16>,
-
+    vertices_start: usize,
+    indices_start: usize,
     vertices_count: usize,
     indices_count: usize,
 
@@ -99,15 +98,10 @@ impl DrawCall {
         pipeline: GlPipeline,
         uniforms: Option<Vec<u8>>,
         render_pass: Option<RenderPass>,
-        max_vertices: usize,
-        max_indices: usize,
     ) -> DrawCall {
         DrawCall {
-            vertices: vec![
-                Vertex::new(0., 0., 0., 0., 0., Color::new(0.0, 0.0, 0.0, 0.0));
-                max_vertices
-            ],
-            indices: vec![0; max_indices],
+            vertices_start: 0,
+            indices_start: 0,
             vertices_count: 0,
             indices_count: 0,
             viewport: None,
@@ -122,14 +116,8 @@ impl DrawCall {
         }
     }
 
-    fn vertices(&self) -> &[Vertex] {
-        &self.vertices[0..self.vertices_count]
-    }
-
-    fn indices(&self) -> &[u16] {
-        &self.indices[0..self.indices_count]
-    }
 }
+
 
 struct MagicSnapshotter {
     pipeline: Pipeline,
@@ -542,7 +530,10 @@ pub struct QuadGl {
     pipelines: PipelinesStorage,
 
     draw_calls: Vec<DrawCall>,
-    draw_calls_bindings: Vec<Bindings>,
+    vertices: Vec<Vertex>,
+    indices: Vec<u16>,
+    bindings: Option<Bindings>,
+    retained_render_pass: Option<RenderPass>,
     draw_calls_count: usize,
     state: GlState,
     start_time: f64,
@@ -572,7 +563,10 @@ impl QuadGl {
                 capture: false,
             },
             draw_calls: Vec::with_capacity(200),
-            draw_calls_bindings: Vec::with_capacity(200),
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            bindings: None,
+            retained_render_pass: None,
             draw_calls_count: 0,
             start_time: miniquad::date::now(),
 
@@ -631,11 +625,19 @@ impl QuadGl {
         let clear = PassAction::clear_color(color.r, color.g, color.b, color.a);
 
         if let Some(current_pass) = self.state.render_pass {
-            ctx.begin_pass(current_pass, clear);
+            if self.retained_render_pass == Some(current_pass) {
+                unsafe { ctx.begin_pass_avoiding_redundant_bind(current_pass, clear); }
+            } else {
+                ctx.begin_pass(current_pass, clear);
+            }
         } else {
             ctx.begin_default_pass(clear);
         }
-        ctx.end_render_pass();
+        if self.retained_render_pass.is_none() || self.retained_render_pass != self.state.render_pass {
+            ctx.end_render_pass();
+        } else {
+            ctx.end_render_pass_preserving_framebuffer();
+        }
 
         self.clear_draw_calls();
     }
@@ -643,47 +645,64 @@ impl QuadGl {
     /// Reset only draw calls state
     pub fn clear_draw_calls(&mut self) {
         self.draw_calls_count = 0;
+        self.vertices.clear();
+        self.indices.clear();
     }
 
     /// Reset internal state to known default
     pub fn reset(&mut self) {
+        self.retained_render_pass = None;
         self.state.clip = None;
         self.state.texture = self.white_texture;
         self.state.model_stack = vec![glam::Mat4::IDENTITY];
 
-        self.draw_calls_count = 0;
+        self.clear_draw_calls();
+    }
+
+    /// Keep this offscreen framebuffer bound after a clear or flush. None
+    /// restores the ordinary flush contract. Snapshot, capture and target
+    /// changes still close their passes; commands and projections are unchanged.
+    ///
+    /// # Safety
+    /// Raw GL consumers must account for the retained framebuffer and buffer
+    /// bindings. The owner must end/replace the framebuffer before observing
+    /// its texture, and clear this option before releasing the render pass.
+    /// This does not extend attachment lifetimes or invalidate any contents.
+    pub unsafe fn retain_render_pass_on_flush(&mut self, pass: Option<RenderPass>) {
+        self.retained_render_pass = pass;
     }
 
     pub fn draw(&mut self, ctx: &mut miniquad::Context, projection: glam::Mat4) {
-        for _ in 0..self.draw_calls.len() - self.draw_calls_bindings.len() {
-            let vertex_buffer = Buffer::stream(
-                ctx,
-                BufferType::VertexBuffer,
-                self.max_vertices * std::mem::size_of::<Vertex>(),
-            );
-            let index_buffer = Buffer::stream(
-                ctx,
-                BufferType::IndexBuffer,
-                self.max_indices * std::mem::size_of::<u16>(),
-            );
-            let bindings = Bindings {
-                vertex_buffers: vec![vertex_buffer],
-                index_buffer,
-                images: vec![Texture::empty(), Texture::empty()],
-            };
-
-            self.draw_calls_bindings.push(bindings);
+        if self.draw_calls_count == 0 {
+            return;
         }
-        assert_eq!(self.draw_calls_bindings.len(), self.draw_calls.len());
+
+        // One contiguous upload per buffer per flush. Per-draw indices are
+        // local; vertex binding offsets select the corresponding arena slice.
+        let vertex_bytes = std::mem::size_of_val(self.vertices.as_slice());
+        let index_bytes = std::mem::size_of_val(self.indices.as_slice());
+        let bindings = self.bindings.get_or_insert_with(|| Bindings {
+            vertex_buffers: vec![Buffer::stream(ctx, BufferType::VertexBuffer, vertex_bytes.max(256).next_power_of_two())],
+            index_buffer: Buffer::stream(ctx, BufferType::IndexBuffer, index_bytes.max(256).next_power_of_two()),
+            images: vec![Texture::empty(), Texture::empty()],
+        });
+        if bindings.vertex_buffers[0].size() < vertex_bytes {
+            bindings.vertex_buffers[0].delete();
+            bindings.vertex_buffers[0] = Buffer::stream(ctx, BufferType::VertexBuffer, vertex_bytes.next_power_of_two());
+        }
+        if bindings.index_buffer.size() < index_bytes {
+            bindings.index_buffer.delete();
+            bindings.index_buffer = Buffer::stream(ctx, BufferType::IndexBuffer, index_bytes.next_power_of_two());
+        }
+        bindings.vertex_buffers[0].update_orphaned(ctx, &self.vertices);
+        bindings.index_buffer.update_orphaned(ctx, &self.indices);
 
         let (screen_width, screen_height) = ctx.screen_size();
         let time = (miniquad::date::now() - self.start_time) as f32;
         let time = glam::vec4(time, time.sin(), time.cos(), 0.);
 
-        for (dc, bindings) in self.draw_calls[0..self.draw_calls_count]
-            .iter_mut()
-            .zip(self.draw_calls_bindings.iter_mut())
-        {
+        let mut active_pass: Option<Option<RenderPass>> = None;
+        for dc in &mut self.draw_calls[0..self.draw_calls_count] {
             let pipeline = self.pipelines.get_quad_pipeline_mut(dc.pipeline);
 
             let (width, height) = if let Some(render_pass) = dc.render_pass {
@@ -695,17 +714,23 @@ impl QuadGl {
             };
 
             if pipeline.wants_screen_texture {
+                if active_pass.take().is_some() {
+                    ctx.end_render_pass();
+                }
                 self.state.snapshotter.snapshot(ctx, dc.render_pass);
             }
 
-            if let Some(render_pass) = dc.render_pass {
-                ctx.begin_pass(render_pass, PassAction::Nothing);
-            } else {
-                ctx.begin_default_pass(PassAction::Nothing);
+            if active_pass != Some(dc.render_pass) {
+                if active_pass.is_some() {
+                    ctx.end_render_pass();
+                }
+                if self.retained_render_pass.is_some() && self.retained_render_pass == dc.render_pass {
+                    unsafe { ctx.begin_pass_avoiding_redundant_bind(dc.render_pass, PassAction::Nothing); }
+                } else {
+                    ctx.begin_pass(dc.render_pass, PassAction::Nothing);
+                }
+                active_pass = Some(dc.render_pass);
             }
-
-            bindings.vertex_buffers[0].update(ctx, dc.vertices());
-            bindings.index_buffer.update(ctx, dc.indices());
 
             bindings.images[0] = dc.texture;
             bindings.images[1] = self.state.snapshotter.screen_texture.map_or_else(
@@ -733,7 +758,8 @@ impl QuadGl {
             } else {
                 ctx.apply_scissor_rect(0, 0, width as i32, height as i32);
             }
-            ctx.apply_bindings(bindings);
+            let vertex_offset = dc.vertices_start * std::mem::size_of::<Vertex>();
+            ctx.apply_bindings_with_offsets(bindings, &[vertex_offset]);
 
             if let Some(ref uniforms) = dc.uniforms {
                 for i in 0..uniforms.len() {
@@ -747,18 +773,24 @@ impl QuadGl {
                 pipeline.uniforms_data.as_ptr(),
                 pipeline.uniforms_data.len(),
             );
-            ctx.draw(0, dc.indices_count as i32, 1);
-            ctx.end_render_pass();
+            ctx.draw(dc.indices_start as i32, dc.indices_count as i32, 1);
+
 
             if dc.capture {
-                telemetry::track_drawcall(&pipeline.pipeline, bindings, dc.indices_count);
+                if active_pass.is_some() { ctx.end_render_pass(); }
+                active_pass = None;
+                telemetry::track_drawcall(&pipeline.pipeline, bindings, vertex_offset, dc.indices_start, dc.indices_count);
             }
 
             dc.vertices_count = 0;
             dc.indices_count = 0;
         }
-
-        self.draw_calls_count = 0;
+        if active_pass.is_some() && active_pass != self.retained_render_pass.map(Some) {
+            ctx.end_render_pass();
+        } else if active_pass.is_some() {
+            ctx.end_render_pass_preserving_framebuffer();
+        }
+        self.clear_draw_calls();
     }
 
     pub(crate) fn capture(&mut self, capture: bool) {
@@ -775,6 +807,18 @@ impl QuadGl {
 
     pub fn get_active_render_pass(&self) -> Option<RenderPass> {
         self.state.render_pass
+    }
+
+    /// Current accumulated model transform, before projection.
+    /// Reading this value does not flush or change the queued commands.
+    pub fn get_model_matrix(&self) -> glam::Mat4 {
+        self.state.model()
+    }
+
+    /// Current logical scissor in framebuffer coordinates with a top-left origin.
+    /// `None` means the entire render target, independently of the viewport.
+    pub fn get_scissor(&self) -> Option<(i32, i32, i32, i32)> {
+        self.state.clip
     }
 
     pub fn is_depth_test_enabled(&self) -> bool {
@@ -831,6 +875,13 @@ impl QuadGl {
 
         let vertices = &vertices[0..self.max_vertices.min(vertices.len())];
         let indices = &indices[0..self.max_indices.min(indices.len())];
+        if vertices.is_empty() || indices.is_empty() {
+            return;
+        }
+        if indices.iter().any(|&index| index as usize >= vertices.len()) {
+            warn!("geometry() contains indices outside the submitted vertices, skipping");
+            return;
+        }
 
         let pip = self.state.pipeline.unwrap_or(
             self.pipelines
@@ -852,8 +903,8 @@ impl QuadGl {
                 || draw_call.pipeline != pip
                 || draw_call.render_pass != self.state.render_pass
                 || draw_call.draw_mode != self.state.draw_mode
-                || draw_call.vertices_count >= self.max_vertices - vertices.len()
-                || draw_call.indices_count >= self.max_indices - indices.len()
+                || draw_call.vertices_count > self.max_vertices - vertices.len()
+                || draw_call.indices_count > self.max_indices - indices.len()
                 || draw_call.capture != self.state.capture
                 || self.state.break_batching
         }) {
@@ -874,14 +925,14 @@ impl QuadGl {
                     pip,
                     uniforms.clone(),
                     self.state.render_pass,
-                    self.max_vertices,
-                    self.max_indices,
                 ));
             }
             self.draw_calls[self.draw_calls_count].texture = self.state.texture;
             self.draw_calls[self.draw_calls_count].uniforms = uniforms;
             self.draw_calls[self.draw_calls_count].vertices_count = 0;
             self.draw_calls[self.draw_calls_count].indices_count = 0;
+            self.draw_calls[self.draw_calls_count].vertices_start = self.vertices.len();
+            self.draw_calls[self.draw_calls_count].indices_start = self.indices.len();
             self.draw_calls[self.draw_calls_count].clip = self.state.clip;
             self.draw_calls[self.draw_calls_count].viewport = self.state.viewport;
             self.draw_calls[self.draw_calls_count].model = self.state.model();
@@ -894,13 +945,8 @@ impl QuadGl {
         };
         let dc = &mut self.draw_calls[self.draw_calls_count - 1];
 
-        for i in 0..vertices.len() {
-            dc.vertices[dc.vertices_count + i] = vertices[i].into().into();
-        }
-
-        for i in 0..indices.len() {
-            dc.indices[dc.indices_count + i] = indices[i] + dc.vertices_count as u16;
-        }
+        self.vertices.extend(vertices.iter().map(|&v| -> Vertex { v.into().into() }));
+        self.indices.extend(indices.iter().map(|&index| index + dc.vertices_count as u16));
         dc.vertices_count += vertices.len();
         dc.indices_count += indices.len();
         dc.texture = self.state.texture;
@@ -938,35 +984,13 @@ impl QuadGl {
 
     pub(crate) fn update_drawcall_capacity(
         &mut self,
-        ctx: &mut Context,
+        _ctx: &mut Context,
         max_vertices: usize,
         max_indices: usize,
     ) {
-        self.max_vertices = max_vertices;
+        assert!(max_vertices > 0 && max_indices > 0);
+        self.max_vertices = max_vertices.min(u16::MAX as usize + 1);
         self.max_indices = max_indices;
-
-        for draw_call in &mut self.draw_calls {
-            draw_call.vertices =
-                vec![Vertex::new(0., 0., 0., 0., 0., Color::new(0.0, 0.0, 0.0, 0.0)); max_vertices];
-            draw_call.indices = vec![0; max_indices];
-        }
-        for binding in &mut self.draw_calls_bindings {
-            let vertex_buffer = Buffer::stream(
-                ctx,
-                BufferType::VertexBuffer,
-                self.max_vertices * std::mem::size_of::<Vertex>(),
-            );
-            let index_buffer = Buffer::stream(
-                ctx,
-                BufferType::IndexBuffer,
-                self.max_indices * std::mem::size_of::<u16>(),
-            );
-            *binding = Bindings {
-                vertex_buffers: vec![vertex_buffer],
-                index_buffer,
-                images: vec![Texture::empty(), Texture::empty()],
-            };
-        }
     }
 }
 
