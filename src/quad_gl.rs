@@ -687,12 +687,17 @@ impl QuadGl {
             images: vec![Texture::empty(), Texture::empty()],
         });
         if bindings.vertex_buffers[0].size() < vertex_bytes {
-            bindings.vertex_buffers[0].delete();
-            bindings.vertex_buffers[0] = Buffer::stream(ctx, BufferType::VertexBuffer, vertex_bytes.next_power_of_two());
+            // Keep the old name alive until allocation completes. GL may reuse
+            // a deleted name while vertex attributes still reference the old
+            // object; miniquad's attribute cache compares those names.
+            let replacement = Buffer::stream(ctx, BufferType::VertexBuffer, vertex_bytes.next_power_of_two());
+            let old = std::mem::replace(&mut bindings.vertex_buffers[0], replacement);
+            old.delete();
         }
         if bindings.index_buffer.size() < index_bytes {
-            bindings.index_buffer.delete();
-            bindings.index_buffer = Buffer::stream(ctx, BufferType::IndexBuffer, index_bytes.next_power_of_two());
+            let replacement = Buffer::stream(ctx, BufferType::IndexBuffer, index_bytes.next_power_of_two());
+            let old = std::mem::replace(&mut bindings.index_buffer, replacement);
+            old.delete();
         }
         bindings.vertex_buffers[0].update_orphaned(ctx, &self.vertices);
         bindings.index_buffer.update_orphaned(ctx, &self.indices);
