@@ -17,6 +17,14 @@ pub enum DrawMode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GlPipeline(usize);
 
+// Buffers remain owned by the caller; the unsafe recording API makes the
+// lifetime and mutation contract explicit. Uniform contents are snapshotted.
+struct ResidentDraw {
+    pipeline: Pipeline,
+    bindings: Bindings,
+    uniforms: std::sync::Arc<[f32]>,
+}
+
 struct DrawCall {
     vertices_start: usize,
     indices_start: usize,
@@ -34,6 +42,7 @@ struct DrawCall {
     uniforms: Option<Vec<u8>>,
     render_pass: Option<RenderPass>,
     capture: bool,
+    resident: Option<ResidentDraw>,
 }
 
 #[repr(C)]
@@ -113,6 +122,7 @@ impl DrawCall {
             uniforms,
             render_pass,
             capture: false,
+            resident: None,
         }
     }
 
@@ -535,6 +545,7 @@ pub struct QuadGl {
     bindings: Option<Bindings>,
     retained_render_pass: Option<RenderPass>,
     draw_calls_count: usize,
+    resident_draws_issued: u64,
     state: GlState,
     start_time: f64,
 
@@ -568,6 +579,7 @@ impl QuadGl {
             bindings: None,
             retained_render_pass: None,
             draw_calls_count: 0,
+            resident_draws_issued: 0,
             start_time: miniquad::date::now(),
 
             white_texture,
@@ -644,6 +656,9 @@ impl QuadGl {
 
     /// Reset only draw calls state
     pub fn clear_draw_calls(&mut self) {
+        for dc in &mut self.draw_calls[..self.draw_calls_count] {
+            dc.resident = None;
+        }
         self.draw_calls_count = 0;
         self.vertices.clear();
         self.indices.clear();
@@ -703,7 +718,8 @@ impl QuadGl {
 
         let mut active_pass: Option<Option<RenderPass>> = None;
         for dc in &mut self.draw_calls[0..self.draw_calls_count] {
-            let pipeline = self.pipelines.get_quad_pipeline_mut(dc.pipeline);
+            let wants_screen_texture = dc.resident.is_none()
+                && self.pipelines.get_quad_pipeline_mut(dc.pipeline).wants_screen_texture;
 
             let (width, height) = if let Some(render_pass) = dc.render_pass {
                 let render_texture = render_pass.texture(ctx);
@@ -713,7 +729,7 @@ impl QuadGl {
                 (screen_width as u32, screen_height as u32)
             };
 
-            if pipeline.wants_screen_texture {
+            if wants_screen_texture {
                 if active_pass.take().is_some() {
                     ctx.end_render_pass();
                 }
@@ -732,6 +748,31 @@ impl QuadGl {
                 active_pass = Some(dc.render_pass);
             }
 
+            // Resident draws use the same ordered target/viewport/clip stream.
+            // They neither upload the CPU geometry arena nor end this pass.
+            if let Some(resident) = dc.resident.as_ref() {
+                ctx.apply_pipeline(&resident.pipeline);
+                let (x, y, w, h) = dc.viewport.unwrap_or((0, 0, width as i32, height as i32));
+                ctx.apply_viewport(x, y, w, h);
+                let (x, y, w, h) = dc.clip.map(|(x, y, w, h)| (x, height as i32 - (y + h), w, h))
+                    .unwrap_or((0, 0, width as i32, height as i32));
+                ctx.apply_scissor_rect(x, y, w, h);
+                ctx.apply_bindings(&resident.bindings);
+                ctx.apply_uniforms_from_bytes(resident.uniforms.as_ptr().cast(), resident.uniforms.len() * 4);
+                ctx.draw(dc.indices_start as i32, dc.indices_count as i32, 1);
+                self.resident_draws_issued += 1;
+                if dc.capture {
+                    if active_pass.is_some() { ctx.end_render_pass(); }
+                    active_pass = None;
+                    telemetry::track_drawcall(&resident.pipeline, &resident.bindings, 0, dc.indices_start, dc.indices_count);
+                }
+                dc.resident = None;
+                dc.vertices_count = 0;
+                dc.indices_count = 0;
+                continue;
+            }
+
+            let pipeline = self.pipelines.get_quad_pipeline_mut(dc.pipeline);
             bindings.images[0] = dc.texture;
             bindings.images[1] = self.state.snapshotter.screen_texture.map_or_else(
                 || Texture::empty(),
@@ -868,6 +909,57 @@ impl QuadGl {
         self.state.draw_mode = mode;
     }
 
+    /// Resident draws actually issued to the graphics backend since creation.
+    pub fn resident_geometry_draw_count(&self) -> u64 { self.resident_draws_issued }
+
+    /// Whether a caller-owned buffer is still referenced by queued commands.
+    /// Flush before mutating/deleting resident resources if this returns true.
+    pub fn has_pending_resident_geometry(&self) -> bool {
+        self.draw_calls[..self.draw_calls_count].iter().any(|dc| dc.resident.is_some())
+    }
+
+    /// Record a custom resident mesh between ordinary geometry commands.
+    /// Snapshot target, viewport and clip; shader uniforms include the caller's
+    /// projection/model. No immediate draw, upload, sort, or implicit flush.
+    ///
+    /// # Safety
+    /// The caller must keep every buffer, texture, pipeline and shader alive
+    /// and unchanged until this queue is drawn or cleared. In particular, an
+    /// index-buffer orphan must not precede an earlier queued use. The bindings,
+    /// index range and f32 uniform layout must match the supplied pipeline.
+    pub unsafe fn resident_geometry(
+        &mut self,
+        pipeline: Pipeline,
+        bindings: Bindings,
+        uniforms: std::sync::Arc<[f32]>,
+        index_start: i32,
+        index_count: i32,
+    ) {
+        if index_start < 0 || index_count <= 0 { return; }
+        let pip = self.pipelines.get(self.state.draw_mode, self.state.depth_test_enable);
+        if self.draw_calls_count >= self.draw_calls.len() {
+            self.draw_calls.push(DrawCall::new(self.state.texture, self.state.model(),
+                self.state.draw_mode, pip, None, self.state.render_pass));
+        }
+        let dc = &mut self.draw_calls[self.draw_calls_count];
+        dc.texture = self.state.texture;
+        dc.model = self.state.model();
+        dc.pipeline = pip;
+        dc.draw_mode = self.state.draw_mode;
+        dc.uniforms = None;
+        dc.vertices_start = 0;
+        dc.vertices_count = 0;
+        dc.indices_start = index_start as usize;
+        dc.indices_count = index_count as usize;
+        dc.viewport = self.state.viewport;
+        dc.clip = self.state.clip;
+        dc.render_pass = self.state.render_pass;
+        dc.capture = self.state.capture;
+        dc.resident = Some(ResidentDraw { pipeline, bindings, uniforms });
+        self.draw_calls_count += 1;
+        self.state.break_batching = false;
+    }
+
     pub fn geometry(&mut self, vertices: &[impl Into<VertexInterop> + Copy], indices: &[u16]) {
         if vertices.len() > self.max_vertices || indices.len() > self.max_indices {
             warn!("geometry() exceeded max drawcall size, clamping");
@@ -896,7 +988,8 @@ impl QuadGl {
         let previous_dc = previous_dc_ix.and_then(|ix| self.draw_calls.get(ix));
 
         if previous_dc.map_or(true, |draw_call| {
-            draw_call.texture != self.state.texture
+            draw_call.resident.is_some()
+                || draw_call.texture != self.state.texture
                 || draw_call.clip != self.state.clip
                 || draw_call.viewport != self.state.viewport
                 || draw_call.model != self.state.model()
@@ -927,6 +1020,7 @@ impl QuadGl {
                     self.state.render_pass,
                 ));
             }
+            self.draw_calls[self.draw_calls_count].resident = None;
             self.draw_calls[self.draw_calls_count].texture = self.state.texture;
             self.draw_calls[self.draw_calls_count].uniforms = uniforms;
             self.draw_calls[self.draw_calls_count].vertices_count = 0;
