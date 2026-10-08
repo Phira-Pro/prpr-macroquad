@@ -28,7 +28,8 @@ all-features = true
 [dependencies]
 # miniquad = { version = "=0.3.14", features = ["log-impl"] }
 # 固定配套提交：批量顶点偏移与离屏生命周期 API 必须匹配，勿改为浮动分支。
-miniquad = { git = "https://github.com/Phira-Pro/prpr-miniquad.git", rev = "1dfaa933c642bc1b0ef3a27701a941b20ee084c1", features = ["log-impl"] }
+# 默认关闭的原生帧循环诊断与读取依赖 API 配套；旧 rev 不支持，升级仍须固定完整提交。
+miniquad = { git = "https://github.com/Phira-Pro/prpr-miniquad.git", rev = "eb0eda0bb48c229750ba9f154ccb101ca0c4f611", features = ["log-impl"] }
 quad-rand = "0.2.3"
 glam = {version = "0.30", features = ["scalar-math"] }
 image = { version = "0.25", default-features = false, features = ["png", "tga"] }
