@@ -999,6 +999,19 @@ impl QuadGl {
         self.state.depth_test_enable
     }
 
+    /// Whether managed geometry uses the built-in material. Depth state remains
+    /// independent; this only reads the queued logical pipeline selection.
+    /// It does not query GL, flush, or mutate queued commands.
+    pub fn is_using_default_material(&self) -> bool {
+        self.state.pipeline.is_none()
+    }
+
+    /// Whether subsequent geometry is marked for telemetry capture.
+    /// Reading this flag does not flush or mutate queued commands.
+    pub fn is_geometry_capture_enabled(&self) -> bool {
+        self.state.capture
+    }
+
     pub fn render_pass(&mut self, render_pass: Option<RenderPass>) {
         self.state.render_pass = render_pass;
     }
