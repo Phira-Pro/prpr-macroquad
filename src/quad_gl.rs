@@ -7,6 +7,8 @@ pub use miniquad::{FilterMode, ShaderError};
 use crate::{color::Color, logging::warn, telemetry, texture::Texture2D};
 
 use std::collections::BTreeMap;
+use crate::texture_reads::{self, Tracker};
+pub use crate::texture_reads::{TextureReadStatus, TextureReadToken};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DrawMode {
@@ -546,6 +548,7 @@ pub struct QuadGl {
     retained_render_pass: Option<RenderPass>,
     draw_calls_count: usize,
     resident_draws_issued: u64,
+    texture_reads: Tracker,
     state: GlState,
     start_time: f64,
 
@@ -580,12 +583,120 @@ impl QuadGl {
             retained_render_pass: None,
             draw_calls_count: 0,
             resident_draws_issued: 0,
+            texture_reads: Tracker::new(ctx.context_id()),
             start_time: miniquad::date::now(),
 
             white_texture,
             max_vertices: 10000,
             max_indices: 5000,
         }
+    }
+
+    /// Register a private fresh texture before its first draw, or a texture
+    /// whose owner already holds a baseline GPU fence covering every prior read.
+    /// Registration does not observe reads made earlier and is not a GPU fence.
+    /// At most 256 textures can be tracked; duplicate/native-zero IDs fail.
+    /// Pass the actual current managed Context ID to every token operation.
+    /// A context mismatch permanently disables tracking in this QuadGl.
+    /// Unregister before deleting/recycling its native name. Never infer GPU
+    /// completion from serial zero. A failed/unknown query needs the original
+    /// flush/fence path. Managed Context identity does not detect native EGL loss.
+    pub fn register_texture_reads(
+        &mut self,
+        texture: Texture,
+        current_context_id: usize,
+    ) -> Option<TextureReadToken> {
+        if !self.texture_reads.check_context(current_context_id) {
+            return None;
+        }
+        self.texture_reads
+            .register(texture.gl_internal_id(), self.draw_calls_count == 0)
+    }
+
+    /// Remove a registration only when no pending command may refer to it.
+    /// In an unknown epoch, flushing first permits safe owner cleanup; this
+    /// method itself never submits commands, waits, deletes or fences a texture.
+    pub fn unregister_texture_reads(
+        &mut self,
+        token: TextureReadToken,
+        current_context_id: usize,
+    ) -> bool {
+        if !self.texture_reads.check_context(current_context_id) {
+            return false;
+        }
+        let Some(texture) = self.texture_reads.texture(token) else {
+            return false;
+        };
+        let pending = self.pending_texture_reads(texture);
+        self.texture_reads.unregister(token, pending)
+    }
+
+    /// Conservative managed possible reads only. This is a current queue
+    /// observation, not permission to mutate resources across later operations.
+    /// Custom/late-bound named materials, ScreenTexture/capture and missing
+    /// pipelines are unknown. Raw GL readers/writers must explicitly invalidate.
+    /// Resident resource lifetimes remain the unsafe recording caller's contract.
+    pub fn texture_read_status(
+        &mut self,
+        token: TextureReadToken,
+        current_context_id: usize,
+    ) -> Option<TextureReadStatus> {
+        if !self.texture_reads.check_context(current_context_id) {
+            return None;
+        }
+        self.texture_reads.status(token, false)?;
+        let texture = self.texture_reads.texture(token)?;
+        let queued = self.pending_texture_reads(texture)?;
+        self.texture_reads.status(token, queued)
+    }
+
+    /// Fail closed before any untracked raw read/write or unsupported helper.
+    /// Existing tokens remain unusable until all are unregistered after a flush.
+    /// An empty queue plus fresh registrations starts a new known epoch.
+    /// Serial/generation exhaustion cannot recover inside this QuadGl.
+    pub fn invalidate_texture_reads(&mut self) {
+        self.texture_reads.invalidate();
+    }
+
+    fn pending_texture_reads(&self, texture: u32) -> Option<bool> {
+        let mut queued = false;
+        for dc in &self.draw_calls[..self.draw_calls_count] {
+            let pending = if let Some(resident) = dc.resident.as_ref() {
+                texture_reads::pending_resident(
+                    texture,
+                    dc.indices_count,
+                    dc.capture,
+                    resident
+                        .bindings
+                        .images
+                        .iter()
+                        .map(|image| image.gl_internal_id()),
+                )
+            } else {
+                let pipeline = self
+                    .pipelines
+                    .pipelines
+                    .get(dc.pipeline.0)
+                    .and_then(|pipeline| pipeline.as_ref())?;
+                texture_reads::pending_normal(
+                    texture,
+                    dc.texture.gl_internal_id(),
+                    dc.indices_count,
+                    dc.capture,
+                    true,
+                    dc.pipeline.0 >= 4,
+                    pipeline.wants_screen_texture,
+                    pipeline.textures.iter().map(|name| {
+                        pipeline
+                            .textures_data
+                            .get(name)
+                            .map(|image| image.gl_internal_id())
+                    }),
+                )
+            };
+            queued |= pending?;
+        }
+        Some(queued)
     }
 
     pub fn make_pipeline(
@@ -688,6 +799,7 @@ impl QuadGl {
     }
 
     pub fn draw(&mut self, ctx: &mut miniquad::Context, projection: glam::Mat4) {
+        self.texture_reads.check_context(ctx.context_id());
         if self.draw_calls_count == 0 {
             return;
         }
@@ -733,6 +845,9 @@ impl QuadGl {
                 if active_pass.take().is_some() {
                     ctx.end_render_pass();
                 }
+                if self.texture_reads.active() {
+                    self.texture_reads.invalidate();
+                }
                 self.state.snapshotter.snapshot(ctx, dc.render_pass);
             }
 
@@ -760,10 +875,19 @@ impl QuadGl {
                 ctx.apply_bindings(&resident.bindings);
                 ctx.apply_uniforms_from_bytes(resident.uniforms.as_ptr().cast(), resident.uniforms.len() * 4);
                 ctx.draw(dc.indices_start as i32, dc.indices_count as i32, 1);
+                if self.texture_reads.active() {
+                    self.texture_reads.submitted(
+                        dc.indices_count,
+                        resident.bindings.images.iter().map(|image| image.gl_internal_id()),
+                    );
+                }
                 self.resident_draws_issued += 1;
                 if dc.capture {
                     if active_pass.is_some() { ctx.end_render_pass(); }
                     active_pass = None;
+                    if self.texture_reads.active() {
+                        self.texture_reads.invalidate();
+                    }
                     telemetry::track_drawcall(&resident.pipeline, &resident.bindings, 0, dc.indices_start, dc.indices_count);
                 }
                 dc.resident = None;
@@ -815,11 +939,20 @@ impl QuadGl {
                 pipeline.uniforms_data.len(),
             );
             ctx.draw(dc.indices_start as i32, dc.indices_count as i32, 1);
+            if self.texture_reads.active() {
+                self.texture_reads.submitted(
+                    dc.indices_count,
+                    bindings.images.iter().map(|image| image.gl_internal_id()),
+                );
+            }
 
 
             if dc.capture {
                 if active_pass.is_some() { ctx.end_render_pass(); }
                 active_pass = None;
+                if self.texture_reads.active() {
+                    self.texture_reads.invalidate();
+                }
                 telemetry::track_drawcall(&pipeline.pipeline, bindings, vertex_offset, dc.indices_start, dc.indices_count);
             }
 
