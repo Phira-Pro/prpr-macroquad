@@ -31,7 +31,8 @@ all-features = true
 # 默认关闭的原生帧循环诊断与读取依赖 API 配套；旧 rev 不支持，升级仍须固定完整提交。
 # 粒子整批 stream 更新使用 Buffer::update_discard 研究 API，固定配套提交。
 # 字体 PBO 上传及受保护的客户端内存回退 API 配套，固定完整提交。
-miniquad = { git = "https://github.com/Phira-Pro/prpr-miniquad.git", rev = "bc1d9d425b4ca7ff0d01929bc58ab3552f266ce9", features = ["log-impl"] }
+# 字体固定 RGBA8 纹理存储研究 API 配套，固定完整提交。
+miniquad = { git = "https://github.com/Phira-Pro/prpr-miniquad.git", rev = "19e97bd3d9b0ecce86ae50558311175a92d933a3", features = ["log-impl"] }
 quad-rand = "0.2.3"
 glam = {version = "0.30", features = ["scalar-math"] }
 image = { version = "0.25", default-features = false, features = ["png", "tga"] }
