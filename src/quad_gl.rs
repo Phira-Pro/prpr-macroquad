@@ -813,6 +813,11 @@ impl QuadGl {
             index_buffer: Buffer::stream(ctx, BufferType::IndexBuffer, index_bytes.max(256).next_power_of_two()),
             images: vec![Texture::empty(), Texture::empty()],
         });
+        // Deleting a buffer may release its name for immediate reuse. Invalidate
+        // cached attribute bindings before either arena buffer is replaced.
+        if bindings.vertex_buffers[0].size() < vertex_bytes || bindings.index_buffer.size() < index_bytes {
+            ctx.clear_resource_bindings();
+        }
         if bindings.vertex_buffers[0].size() < vertex_bytes {
             bindings.vertex_buffers[0].delete();
             bindings.vertex_buffers[0] = Buffer::stream(ctx, BufferType::VertexBuffer, vertex_bytes.next_power_of_two());
