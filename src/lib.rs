@@ -321,6 +321,7 @@ impl Context {
     }
 
     fn begin_frame(&mut self) {
+        telemetry::gpu_frame_begin();
         telemetry::begin_gpu_query("GPU");
 
         self.ui_context.process_input();
@@ -341,6 +342,7 @@ impl Context {
         self.gl.draw(get_quad_context(), screen_mat);
 
         get_quad_context().commit_frame();
+        telemetry::gpu_frame_end();
 
         #[cfg(one_screenshot)]
         {

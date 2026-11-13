@@ -2,6 +2,49 @@ use crate::{get_context, get_quad_context, time::get_time};
 
 use std::collections::HashMap;
 
+mod frame_gpu;
+pub use frame_gpu::{FrameGpuSample, FrameGpuSamplingStats};
+
+static mut FRAME_GPU: Option<frame_gpu::FrameGpuSampler> = None;
+
+fn frame_gpu_sampler() -> &'static mut frame_gpu::FrameGpuSampler {
+    unsafe { FRAME_GPU.get_or_insert_with(frame_gpu::FrameGpuSampler::new) }
+}
+
+/// Opt in to whole-draw GPU timing on the rendering thread. Applied at the next
+/// draw frame's start, so disabling during a query never deletes an active timer.
+/// Disable and allow one further draw before destroying the GL context to release
+/// query objects. Already completed samples remain available after disabling.
+pub fn set_frame_gpu_sampling(enabled: bool) {
+    frame_gpu_sampler().set_enabled(enabled);
+}
+
+/// Drain completed samples. Results arrive asynchronously; missing frames are
+/// not represented by zero durations. Only this drain allocates an output Vec.
+pub fn take_frame_gpu_samples() -> Vec<FrameGpuSample> {
+    frame_gpu_sampler().take_samples()
+}
+
+pub fn frame_gpu_sampling_stats() -> FrameGpuSamplingStats {
+    frame_gpu_sampler().stats()
+}
+
+/// The current actual draw frame, incremented before the user future is polled,
+/// even when sampling is disabled. Zero means no draw frame has started yet.
+/// Match this ID to FrameGpuSample::submission_frame, not the retrieval frame.
+pub fn current_frame_id() -> u64 {
+    frame_gpu_sampler().stats().frame_id
+}
+
+pub(crate) fn gpu_frame_begin() {
+    let legacy_active = get_profiler().queries.values().any(|query| query.in_progress);
+    frame_gpu_sampler().begin(legacy_active);
+}
+
+pub(crate) fn gpu_frame_end() {
+    frame_gpu_sampler().end();
+}
+
 static mut PROFILER: Option<Profiler> = None;
 
 fn get_profiler() -> &'static mut Profiler {
@@ -219,7 +262,7 @@ impl Profiler {
                 force_resume: false,
             });
         self.active_query = Some(name);
-        if query.force_resume {
+        if query.force_resume && !frame_gpu_sampler().stats().enabled {
             query.in_progress = true;
             query.query.begin_query();
         }
